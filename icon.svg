@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <rect width="256" height="256" rx="56" fill="#1f2430"/>
+  <!-- hover bubble -->
+  <path d="M40 60h176a16 16 0 0 1 16 16v84a16 16 0 0 1-16 16H118l-30 30v-30H40a16 16 0 0 1-16-16V76a16 16 0 0 1 16-16z" fill="#2d3445" stroke="#76b900" stroke-width="6"/>
+  <!-- code lines -->
+  <rect x="52" y="92" width="64" height="12" rx="6" fill="#8b95a8"/>
+  <rect x="52" y="120" width="96" height="12" rx="6" fill="#8b95a8"/>
+  <rect x="52" y="148" width="44" height="12" rx="6" fill="#8b95a8"/>
+  <!-- sparkle -->
+  <path d="M184 86c4 22 10 28 32 32-22 4-28 10-32 32-4-22-10-28-32-32 22-4 28-10 32-32z" fill="#f5c542"/>
+</svg>

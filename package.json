@@ -1,0 +1,95 @@
+{
+  "name": "hover-explain",
+  "displayName": "Hover Explain",
+  "description": "Cmd/Ctrl+hover any symbol for a short AI explanation in the hover. Works with NVIDIA, OpenAI, OpenRouter, Groq, Gemini, Ollama, LM Studio, any OpenAI-compatible API, or Claude Code.",
+  "version": "0.3.0",
+  "publisher": "revan99",
+  "author": "Revan Sarbast",
+  "license": "MIT",
+  "icon": "icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Revan99/hover-explain.git"
+  },
+  "homepage": "https://github.com/Revan99/hover-explain#readme",
+  "bugs": {
+    "url": "https://github.com/Revan99/hover-explain/issues"
+  },
+  "keywords": ["ai", "explain", "hover", "llm", "openai", "ollama", "nvidia", "claude", "code explanation"],
+  "galleryBanner": {
+    "color": "#1f2430",
+    "theme": "dark"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": ["AI", "Programming Languages", "Other"],
+  "main": "./extension.js",
+  "activationEvents": ["onStartupFinished"],
+  "contributes": {
+    "commands": [
+      {
+        "command": "hoverExplain.explain",
+        "title": "Hover Explain: Explain Symbol at Cursor"
+      },
+      {
+        "command": "hoverExplain.chooseProvider",
+        "title": "Hover Explain: Choose Provider"
+      },
+      {
+        "command": "hoverExplain.chooseModel",
+        "title": "Hover Explain: Choose Model"
+      },
+      {
+        "command": "hoverExplain.setApiKey",
+        "title": "Hover Explain: Set API Key"
+      },
+      {
+        "command": "hoverExplain.clearCache",
+        "title": "Hover Explain: Clear Cache"
+      }
+    ],
+    "configuration": {
+      "title": "Hover Explain",
+      "properties": {
+        "hoverExplain.provider": {
+          "type": "string",
+          "enum": ["nvidia", "openai", "openrouter", "groq", "gemini", "ollama", "lmstudio", "custom", "claude-code"],
+          "enumDescriptions": [
+            "NVIDIA build.nvidia.com (free tier)",
+            "OpenAI",
+            "OpenRouter (hundreds of models behind one key)",
+            "Groq",
+            "Google Gemini (OpenAI-compatible endpoint)",
+            "Ollama on this machine (no key)",
+            "LM Studio on this machine (no key)",
+            "Any OpenAI-compatible API at hoverExplain.baseUrl",
+            "Claude Code CLI with its own login"
+          ],
+          "default": "nvidia",
+          "description": "Where explanations come from. Easiest to change with \"Hover Explain: Choose Provider\"."
+        },
+        "hoverExplain.model": {
+          "type": "string",
+          "default": "",
+          "description": "Model id for the chosen provider. Empty uses the provider's default (NVIDIA: nvidia/nemotron-3.5-lightning-30b-a3b, Claude Code: haiku); other providers need one. \"Hover Explain: Choose Model\" lists what's available."
+        },
+        "hoverExplain.baseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Base URL of an OpenAI-compatible API (the part before /chat/completions). Required for the custom provider; overrides the built-in URL for the others."
+        },
+        "hoverExplain.claudePath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the claude CLI. Empty = ~/.local/bin/claude, then PATH."
+        },
+        "hoverExplain.timeoutSeconds": {
+          "type": "number",
+          "default": 60,
+          "description": "Give up on a request after this many seconds."
+        }
+      }
+    }
+  }
+}
