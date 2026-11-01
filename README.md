@@ -8,8 +8,8 @@ Works in Cursor, VS Code, Windsurf, VSCodium and other VS Code–based editors, 
 
 ## How to use
 
-1. Hold **Cmd** / **Ctrl** and rest the mouse on a symbol for a moment. A spinner appears in the status bar.
-2. Release the key and keep the mouse there. The hover shows "Loading…", then the explanation, labelled with the provider and model that wrote it.
+1. Hover a symbol and press **Cmd** / **Ctrl**, or hold the key first and then move onto the symbol.
+2. Keep the mouse there; you can release the key. The hover shows "Loading…" and fills in the explanation when it arrives, labelled with the provider and model that wrote it.
 3. Hovering the same symbol again shows the explanation straight away, until you edit the file.
 
 You can also run **Hover Explain: Explain Symbol at Cursor** from the Command Palette to explain the symbol at the text cursor.
@@ -67,9 +67,11 @@ Nothing is sent when you hover without the modifier key. If your code must not l
 
 ## How the Cmd+hover trigger works
 
-Extensions can't see which keys are held during a hover. While Cmd/Ctrl is held, though, the editor asks extensions for the definition of the word under the mouse so it can underline it. Hover Explain answers that request with nothing and starts the explanation instead, so Go to Definition and Cmd+click work as before.
+Extensions can't see which keys are held during a hover. While Cmd/Ctrl is held, though, the editor asks extensions for the definition of the word under the mouse so it can underline it. Hover Explain answers that request with nothing, so Go to Definition and Cmd+click work as before, and uses it as the trigger.
 
-Because of this, **F12 (Go to Definition)** also starts an explanation for the symbol, as does any other feature or extension that looks up definitions in the active editor.
+Definitions are also looked up in the background (by the editor's own AI features, for example). Those never cause a request: an explanation starts only when the editor also asks for a hover on that same word, which happens only for the word under the mouse.
+
+If you were already resting on the word when you pressed Cmd, the editor has finished that hover and won't ask again until the mouse moves. Hover Explain then reopens the hover itself; the editor only allows that at the text cursor, so the cursor is moved onto the word for an instant and put straight back.
 
 ## License
 

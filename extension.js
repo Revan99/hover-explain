@@ -35,24 +35,45 @@ const LEGACY_NVIDIA_KEY = 'hoverExplain.nvidiaApiKey';
 /** key -> { status: 'pending' | 'done' | 'error', text: string, label: string, promise: Promise } */
 const cache = new Map();
 let statusItem;
+let configItem;
 let secrets;
-const CMD_HOVER_DELAY_MS = 350;
-let cmdHoverTimer;
+let state;
+const SETTING_DEFAULTS = { provider: 'nvidia', model: '', baseUrl: '', claudePath: '', timeoutSeconds: 60 };
+// How long after the Cmd+hover definition lookup the hover request may come: the editor
+// asks for a hover once the mouse has rested (editor.hover.delay, 300ms by default).
+const ARM_WINDOW_MS = 4000;
+let lastEditAt = 0;
+let log;
+/** The word of the latest definition lookup (Cmd+hover or background): { key, at } */
+let armed;
+/** The last hover the editor asked for: { key, at, ours } */
+let lastHover;
+/** Word whose hover is being reopened after Cmd was pressed on it */
+let reopenedKey;
 let internalLookups = 0;
 
 function activate(context) {
   secrets = context.secrets;
+  state = context.globalState;
+  log = vscode.window.createOutputChannel('Hover Explain', { log: true });
   statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+  configItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 99);
+  configItem.command = 'hoverExplain.chooseProvider';
+  updateConfigItem();
   context.subscriptions.push(
+    log,
     statusItem,
+    configItem,
+    secrets.onDidChange(() => updateConfigItem()),
+    vscode.workspace.onDidChangeConfiguration(onConfigChange),
+    vscode.workspace.onDidChangeTextDocument(() => (lastEditAt = Date.now())),
     vscode.languages.registerHoverProvider({ scheme: '*' }, { provideHover }),
     vscode.languages.registerDefinitionProvider({ scheme: '*' }, { provideDefinition }),
     vscode.commands.registerCommand('hoverExplain.explain', explainCommand),
     vscode.commands.registerCommand('hoverExplain.clearCache', () => cache.clear()),
-    vscode.commands.registerCommand('hoverExplain.chooseProvider', chooseProvider),
-    vscode.commands.registerCommand('hoverExplain.chooseModel', chooseModel),
-    vscode.commands.registerCommand('hoverExplain.setApiKey', setApiKey),
-    vscode.workspace.onDidChangeConfiguration((e) => e.affectsConfiguration('hoverExplain') && cache.clear()),
+    vscode.commands.registerCommand('hoverExplain.chooseProvider', reportErrors(chooseProvider)),
+    vscode.commands.registerCommand('hoverExplain.chooseModel', reportErrors(() => chooseModel())),
+    vscode.commands.registerCommand('hoverExplain.setApiKey', reportErrors(() => setApiKey())),
   );
 }
 
@@ -60,17 +81,62 @@ function config() {
   return vscode.workspace.getConfiguration('hoverExplain');
 }
 
+// Choices made in the setup commands are kept in globalState as well as in settings,
+// because the editor can refuse settings writes (e.g. after an extension swap left
+// the settings unregistered until a full restart). A setting edited by hand wins:
+// onConfigChange drops the stored copy so the edited value is used.
+function setting(key) {
+  const stored = state.get(`setting.${key}`);
+  if (stored !== undefined) return stored;
+  const value = config().get(key);
+  return value !== undefined ? value : SETTING_DEFAULTS[key];
+}
+
+async function saveSetting(key, value) {
+  await state.update(`setting.${key}`, value === undefined ? SETTING_DEFAULTS[key] : value);
+  try {
+    await config().update(key, value, vscode.ConfigurationTarget.Global);
+  } catch {
+    // Kept in globalState; settings.json just won't show it.
+  }
+}
+
+function onConfigChange(e) {
+  if (!e.affectsConfiguration('hoverExplain')) return;
+  for (const key of Object.keys(SETTING_DEFAULTS)) {
+    if (!e.affectsConfiguration(`hoverExplain.${key}`)) continue;
+    // Ignore the echo of our own write; a different value means a hand edit.
+    if (config().get(key) !== state.get(`setting.${key}`)) state.update(`setting.${key}`, undefined);
+  }
+  cache.clear();
+  updateConfigItem();
+}
+
 function currentProvider() {
-  const id = config().get('provider');
+  return providerById(setting('provider'));
+}
+
+function providerById(id) {
   return { id, ...(PROVIDERS[id] || PROVIDERS.custom) };
 }
 
+// Command errors otherwise only reach the log, leaving a setup step that silently stops.
+function reportErrors(fn) {
+  return async (...args) => {
+    try {
+      return await fn(...args);
+    } catch (err) {
+      vscode.window.showErrorMessage(`Hover Explain: ${err.message || err}`);
+    }
+  };
+}
+
 function currentModel(provider = currentProvider()) {
-  return config().get('model') || provider.model || '';
+  return setting('model') || provider.model || '';
 }
 
 function baseUrl(provider) {
-  return (config().get('baseUrl') || provider.baseUrl || '').replace(/\/+$/, '');
+  return (setting('baseUrl') || provider.baseUrl || '').replace(/\/+$/, '');
 }
 
 function secretName(providerId) {
@@ -84,80 +150,117 @@ async function getApiKey(providerId) {
 // ---------- setup commands ----------
 
 async function chooseProvider() {
-  const current = config().get('provider');
+  const current = setting('provider');
   const pick = await vscode.window.showQuickPick(
     Object.entries(PROVIDERS).map(([id, p]) => ({ id, label: p.label, description: id === current ? 'current' : p.baseUrl || '' })),
     { title: 'Hover Explain: provider' },
   );
   if (!pick) return;
-  await config().update('provider', pick.id, vscode.ConfigurationTarget.Global);
-  // A model name from another provider would not work here.
-  await config().update('model', undefined, vscode.ConfigurationTarget.Global);
+  const provider = providerById(pick.id);
 
-  const provider = currentProvider();
+  // Collect everything first and save at the end, so a cancelled step changes nothing.
+  let url;
   if (pick.id === 'custom') {
-    const url = await vscode.window.showInputBox({
+    url = await vscode.window.showInputBox({
       title: 'Base URL of the OpenAI-compatible API',
       placeHolder: 'https://example.com/v1',
-      value: config().get('baseUrl'),
+      value: setting('baseUrl'),
       ignoreFocusOut: true,
     });
-    if (url === undefined) return;
-    await config().update('baseUrl', url.trim(), vscode.ConfigurationTarget.Global);
-  } else {
-    await config().update('baseUrl', undefined, vscode.ConfigurationTarget.Global);
+    if (!url || !url.trim()) return;
+    provider.baseUrl = url.trim();
   }
-  if (!provider.cli && !provider.noKey && !(await getApiKey(pick.id))) {
-    if (!(await setApiKey())) return;
+  if (!provider.cli && !provider.noKey) {
+    // Always show the key step so it's clear where the key goes; empty keeps a saved one.
+    // Custom APIs may not need a key at all.
+    if (!(await setApiKey(provider, { keepIfEmpty: true })) && pick.id !== 'custom') return;
   }
-  await chooseModel();
+
+  await saveSetting('provider', pick.id);
+  await saveSetting('baseUrl', url ? url.trim() : undefined);
+  // A model name from another provider would not work here.
+  await saveSetting('model', undefined);
+  await chooseModel(provider);
 }
 
-async function setApiKey() {
-  const provider = currentProvider();
-  if (provider.cli) {
-    vscode.window.showInformationMessage('Claude Code uses its own login. Run `claude` in a terminal and use /login.');
+async function setApiKey(provider = currentProvider(), { keepIfEmpty = false } = {}) {
+  if (provider.cli || provider.noKey) {
+    vscode.window.showInformationMessage(
+      provider.cli ? 'Claude Code uses its own login. Run `claude` in a terminal and use /login.' : `${provider.label} doesn't need an API key.`,
+    );
     return false;
   }
+  const saved = Boolean(await getApiKey(provider.id));
+  const where = provider.keyUrl ? `Get one at ${provider.keyUrl}. ` : '';
   const key = await vscode.window.showInputBox({
-    title: `${provider.label} API key`,
-    prompt: provider.keyUrl ? `Get one at ${provider.keyUrl}. Leave empty to remove the saved key.` : 'Leave empty to remove the saved key.',
+    title: `Hover Explain: ${provider.label} API key${saved ? ' (one is saved)' : ''}`,
+    prompt: where + (saved ? (keepIfEmpty ? 'Leave empty to keep the saved key.' : 'Leave empty to remove the saved key.') : 'Paste your key and press Enter.'),
+    placeHolder: saved ? '••••••••  (saved)' : 'API key',
     password: true,
     ignoreFocusOut: true,
   });
   if (key === undefined) return false;
+  if (!key.trim() && saved && keepIfEmpty) return true;
   if (key.trim()) await secrets.store(secretName(provider.id), key.trim());
   else await secrets.delete(secretName(provider.id));
   cache.clear();
-  vscode.window.setStatusBarMessage(`Hover Explain: ${provider.label} key ${key.trim() ? 'saved' : 'removed'}`, 3000);
-  return true;
+  vscode.window.showInformationMessage(`Hover Explain: ${provider.label} API key ${key.trim() ? 'saved' : 'removed'}.`);
+  return Boolean(key.trim());
 }
 
-async function chooseModel() {
-  const provider = currentProvider();
-  let ids = CLAUDE_CODE_MODELS;
-  if (!provider.cli) {
-    try {
-      ids = await listModels(provider);
-    } catch (err) {
-      ids = [];
-      vscode.window.showWarningMessage(`Hover Explain: couldn't list ${provider.label} models (${err.message}). Type a model id instead.`);
-    }
-  }
+async function chooseModel(provider = currentProvider()) {
   const current = currentModel(provider);
   const typeOwn = { label: '$(edit) Type a model id…', id: '' };
-  const pick = await vscode.window.showQuickPick(
-    [typeOwn, ...ids.map((id) => ({ label: id, id, description: id === current ? 'current' : '' }))],
-    { title: `Hover Explain: ${provider.label} model`, placeHolder: current || 'Search models', matchOnDescription: true },
-  );
+  const toItems = (ids) => [typeOwn, ...ids.map((id) => ({ label: id, id, description: id === current ? 'current' : '' }))];
+
+  // Open the picker straight away and fill it once the provider's model list arrives.
+  const qp = vscode.window.createQuickPick();
+  qp.title = `Hover Explain: ${provider.label} model`;
+  qp.placeholder = current ? `Current: ${current}. Search models` : 'Search models';
+  qp.matchOnDescription = true;
+  qp.ignoreFocusOut = true;
+  qp.items = toItems(provider.cli ? CLAUDE_CODE_MODELS : []);
+  qp.busy = !provider.cli;
+  const picked = new Promise((resolve) => {
+    qp.onDidAccept(() => resolve(qp.selectedItems[0]));
+    qp.onDidHide(() => resolve(undefined));
+  });
+  qp.show();
+  if (!provider.cli) {
+    listModels(provider)
+      .then((ids) => {
+        qp.items = toItems(ids);
+        if (current) qp.activeItems = qp.items.filter((i) => i.id === current);
+      })
+      .catch((err) => {
+        qp.placeholder = `Couldn't list models (${err.message}). Choose "Type a model id…"`;
+      })
+      .finally(() => (qp.busy = false));
+  }
+  const pick = await picked;
+  qp.dispose();
   if (!pick) return;
   let model = pick.id;
   if (pick === typeOwn) {
     model = await vscode.window.showInputBox({ title: 'Model id', value: current, ignoreFocusOut: true });
     if (!model) return;
   }
-  await config().update('model', model.trim(), vscode.ConfigurationTarget.Global);
-  vscode.window.setStatusBarMessage(`Hover Explain: using ${provider.label} · ${model.trim()}`, 4000);
+  await saveSetting('model', model.trim());
+  updateConfigItem();
+  vscode.window.showInformationMessage(`Hover Explain: using ${provider.label} · ${model.trim()}. Cmd/Ctrl+hover a symbol to try it.`);
+}
+
+// Status bar entry showing what explanations will use; click to change it.
+async function updateConfigItem() {
+  const provider = currentProvider();
+  const model = currentModel(provider);
+  const missingKey = !provider.cli && !provider.noKey && provider.id !== 'custom' && !(await getApiKey(provider.id));
+  const ready = model && !missingKey;
+  configItem.text = ready ? `$(sparkle) ${provider.label}` : '$(warning) Hover Explain: set up';
+  configItem.tooltip = ready
+    ? `Hover Explain: ${provider.label} · ${model}. Cmd/Ctrl+hover a symbol. Click to change.`
+    : `Hover Explain needs ${missingKey ? `a ${provider.label} API key` : 'a model'}. Click to set up.`;
+  configItem.show();
 }
 
 async function listModels(provider) {
@@ -184,28 +287,101 @@ function provideDefinition(doc, position) {
   // Our own context lookups go through the definition providers too.
   if (internalLookups > 0) return;
   const editor = vscode.window.activeTextEditor;
-  if (!editor || editor.document !== doc || !vscode.window.state.focused) return;
+  if (!editor || editor.document !== doc) return;
   const range = doc.getWordRangeAtPosition(position);
   if (!range) return;
-  // Moving to another word with Cmd held replaces the timer, so only a resting mouse fires.
-  clearTimeout(cmdHoverTimer);
-  cmdHoverTimer = setTimeout(() => explainAt(doc, range), CMD_HOVER_DELAY_MS);
+  const key = cacheKey(doc, range);
+
+  // Arm the word. The explanation starts only when the editor also asks for a hover on
+  // it (provideHover): definitions are looked up in the background too (the editor's AI
+  // features, other extensions), but only the word under the mouse gets a hover request.
+  armed = { key, at: Date.now() };
+  log.trace(`definition lookup ${describe(doc, range)}`);
+
+  // Cmd pressed while already resting on the word: the editor finished that hover
+  // without us and only asks again on mouse movement, so ask for a new one.
+  if (lastHover && lastHover.key === key && !lastHover.ours && Date.now() - lastEditAt > 1500) {
+    log.info(`Cmd pressed on hovered ${describe(doc, range)}: reopening the hover`);
+    // A reopened hover shows nothing new until every provider has answered (no
+    // "Loading…" line, unlike one opened by the mouse), so answer it at once with a
+    // "thinking" line and reopen it again when the answer is in.
+    reopenedKey = key;
+    reshowHover(editor, range.start);
+  }
+}
+
+function describe(doc, range) {
+  return `"${doc.getText(range)}" (${relPath(doc.uri)}:${range.start.line + 1}:${range.start.character + 1})`;
+}
+
+// The editor only lets extensions open a hover at the (primary) text cursor, and reads it
+// synchronously when the command runs. Add a primary cursor on the word, keeping the
+// user's cursors as secondary ones so they never leave their place, run the command and
+// restore without waiting in between: the three messages reach the editor in order, so
+// the extra cursor exists only for that instant. An open hover stays where it is
+// anchored when the cursors change.
+function reshowHover(editor, position) {
+  const saved = editor.selections;
+  editor.selections = [new vscode.Selection(position, position), ...saved];
+  const shown = vscode.commands.executeCommand('editor.action.showHover', { focus: 'noAutoFocus' });
+  editor.selections = saved;
+  shown.then(undefined, (err) => log.warn(`couldn't reopen the hover: ${err.message || err}`));
 }
 
 async function provideHover(doc, position, token) {
   const range = doc.getWordRangeAtPosition(position);
-  if (!range) return;
-  const entry = cache.get(cacheKey(doc, range));
+  // Any hover request means the mouse rests there now, word or not.
+  if (!range) {
+    lastHover = { key: undefined, at: Date.now(), ours: false };
+    return;
+  }
+  const key = cacheKey(doc, range);
+  let entry = cache.get(key);
+  if ((!entry || entry.status === 'error') && armed && armed.key === key && Date.now() - armed.at < ARM_WINDOW_MS) {
+    log.info(`Cmd+hover on ${describe(doc, range)}`);
+    explainAt(doc, range);
+    entry = cache.get(key);
+  }
+  lastHover = { key, at: Date.now(), ours: Boolean(entry) };
   if (!entry) return;
-  // The editor shows "Loading…" while this awaits, then the answer.
-  if (entry.status === 'pending') await entry.promise;
-  if (token.isCancellationRequested) return;
 
+  if (entry.status === 'pending' && reopenedKey === key) {
+    reopenedKey = undefined;
+    entry.reopenWhenDone = true;
+    return thinkingHover(entry, range);
+  }
+  // Opened by the mouse: the editor shows the other providers' content and a "Loading…"
+  // line meanwhile, and adds ours when this resolves.
+  if (entry.status === 'pending') await entry.promise;
+  if (token.isCancellationRequested) {
+    log.info(`hover for ${describe(doc, range)} was closed before the answer arrived`);
+    return;
+  }
   const md = new vscode.MarkdownString();
   md.supportThemeIcons = true;
   md.appendMarkdown(`$(sparkle) **${entry.label}**${entry.status === 'error' ? ' (error)' : ''}\n\n`);
   md.appendMarkdown(entry.text);
   return new vscode.Hover(md, range);
+}
+
+function thinkingHover(entry, range) {
+  const md = new vscode.MarkdownString();
+  md.supportThemeIcons = true;
+  md.appendMarkdown(`$(loading~spin) **${entry.label}** is thinking…`);
+  return new vscode.Hover(md, range);
+}
+
+// After a "thinking" hover: reopen it with the answer, but only if the mouse is still on
+// the word (no hover asked for anywhere else since) and the user isn't typing.
+function reopenWithAnswer(doc, range, key) {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor || editor.document !== doc || !lastHover || lastHover.key !== key || Date.now() - lastEditAt < 1500) {
+    log.info(`answer for ${describe(doc, range)} ready; mouse moved on, not reopening`);
+    return;
+  }
+  // The editor ignores a reopen anchored where the open hover already is; the first
+  // reopen used the word's start, so anchor this one at its end (still the same word).
+  reshowHover(editor, range.end);
 }
 
 // Command-palette fallback: explain the symbol at the text cursor.
@@ -218,11 +394,8 @@ async function explainCommand() {
     vscode.window.setStatusBarMessage('Hover Explain: no symbol under the cursor', 3000);
     return;
   }
-  await explainAt(doc, range);
-  const active = vscode.window.activeTextEditor;
-  if (active && active.document === doc && range.contains(active.selection.active)) {
-    await vscode.commands.executeCommand('editor.action.showHover');
-  }
+  explainAt(doc, range);
+  await vscode.commands.executeCommand('editor.action.showHover', { focus: 'noAutoFocus' });
 }
 
 function explainAt(doc, range) {
@@ -237,18 +410,23 @@ function explainAt(doc, range) {
   statusItem.text = `$(loading~spin) ${provider.label}: ${doc.getText(range)}`;
   statusItem.show();
   entry.promise = (async () => {
+    const started = Date.now();
     try {
       const prompt = await buildPrompt(doc, range);
+      log.info(`asking ${entry.label} about ${describe(doc, range)} (context gathered in ${Date.now() - started}ms)`);
       entry.text = provider.cli ? await askClaudeCode(prompt, model) : await askOpenAICompatible(provider, model, prompt);
       entry.status = 'done';
+      log.info(`answer for ${describe(doc, range)} after ${Date.now() - started}ms`);
     } catch (err) {
       entry.text = String(err.message || err);
       entry.status = 'error';
+      log.error(`request for ${describe(doc, range)} failed after ${Date.now() - started}ms: ${entry.text}`);
       if (provider.cli && /auth|login|OAuth/i.test(entry.text)) {
         vscode.window.showWarningMessage('Hover Explain: Claude Code is not logged in. Run `claude` in a terminal and use /login.');
       }
     } finally {
       statusItem.hide();
+      if (entry.reopenWhenDone) reopenWithAnswer(doc, range, key);
     }
   })();
   return entry.promise;
@@ -309,7 +487,7 @@ async function safeExec(command, ...args) {
 // ---------- backends ----------
 
 function claudeBinary() {
-  const configured = config().get('claudePath');
+  const configured = setting('claudePath');
   if (configured) return configured;
   const local = path.join(os.homedir(), '.local', 'bin', 'claude');
   return fs.existsSync(local) ? local : 'claude';
@@ -319,7 +497,7 @@ function askClaudeCode(prompt, model) {
   const args = ['-p', '--model', model, '--system-prompt', SYSTEM_PROMPT, '--tools', '', '--strict-mcp-config', '--no-session-persistence'];
   const cwd = (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0].uri.fsPath) || os.homedir();
   return new Promise((resolve, reject) => {
-    const child = execFile(claudeBinary(), args, { cwd, timeout: config().get('timeoutSeconds') * 1000, maxBuffer: 1 << 20 }, (err, stdout, stderr) => {
+    const child = execFile(claudeBinary(), args, { cwd, timeout: setting('timeoutSeconds') * 1000, maxBuffer: 1 << 20 }, (err, stdout, stderr) => {
       if (err) return reject(new Error((stderr || stdout || err.message).trim()));
       resolve(stdout.trim());
     });
@@ -353,7 +531,7 @@ async function askOpenAICompatible(provider, model, prompt) {
       temperature: 0.2,
       max_tokens: 1024,
     }),
-    signal: AbortSignal.timeout(config().get('timeoutSeconds') * 1000),
+    signal: AbortSignal.timeout(setting('timeoutSeconds') * 1000),
   });
   const body = await res.text();
   if (!res.ok) throw new Error(`${provider.label} ${res.status}: ${body.slice(0, 300)}`);

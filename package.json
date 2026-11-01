@@ -2,7 +2,7 @@
   "name": "hover-explain",
   "displayName": "Hover Explain",
   "description": "Cmd/Ctrl+hover any symbol for a short AI explanation in the hover. Works with NVIDIA, OpenAI, OpenRouter, Groq, Gemini, Ollama, LM Studio, any OpenAI-compatible API, or Claude Code.",
-  "version": "0.3.0",
+  "version": "0.4.2",
   "publisher": "revan99",
   "author": "Revan Sarbast",
   "license": "MIT",
